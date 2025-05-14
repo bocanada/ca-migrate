@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "anyio>=4.9.0",
     "httpx>=0.28.1",
     "lxml>=5.4.0",
 ]
@@ -20,5 +21,6 @@ build-backend = "hatchling.build"
 dev = [
     "basedpyright>=1.29.1",
     "mypy>=1.15.0",
+    "ruff>=0.11.9",
     "types-lxml>=2025.3.30",
 ]

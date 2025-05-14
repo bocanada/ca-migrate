@@ -1,8 +1,10 @@
-from collections.abc import Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Self, override
 
+import anyio as aio
+from anyio.streams.memory import MemoryObjectSendStream
 from httpx import (
     URL,
     USE_CLIENT_DEFAULT,
@@ -102,7 +104,7 @@ class Client:
         pass_el.text = password
 
         try:
-            resp = await self.run_xog(login_el)
+            resp, _ = await self.run_xog(login_el)
         except XogException as e:
             raise AuthException(e.doc) from e
 
@@ -125,7 +127,11 @@ class Client:
         logout_el = xml.create_element("Logout", ns="xog")
         _ = await self.run_xog(logout_el)
 
-    async def run_xog(self, data: xml.Element) -> xml.Element:
+    async def run_xog(self, data: xml.Element) -> tuple[xml.Element, int | None]:
+        """
+        # Returns
+        Returns the parsed XML response and the next `Skip` value for pagination.
+        """
         if self.auth is None:
             data = xml.make_envelope(data)
         else:
@@ -170,38 +176,94 @@ class Xogger:
     src: Client
     dest: Client
 
+    async def aiter_paginate(
+        self,
+        databus: xog.DataBus,
+        transform_fn: Callable[[xml.Element], xml.Element] | None = None,
+    ) -> AsyncIterator[tuple[int, xml.Element]]:
+        from itertools import count
+
+        for page_num in count(1):
+            # this will always runs once
+            content_pack = databus.as_xml()
+            resp, skip = await self.src.run_xog(content_pack)
+            if transform_fn is not None:
+                resp = transform_fn(resp)
+
+            yield page_num, resp
+            if skip is None:
+                break
+            databus.header.args["skip"] = skip
+
     async def migrate(
         self,
         content: Xoggable,
         transform_fn: Callable[[xml.Element], xml.Element] | None = None,
-    ) -> xml.Element:
+        buffer: int = 3,
+    ) -> list[xml.Element]:
         """
         # Parameters
         - `content`: content to XOG from `src` to `dest`.
-        - `clean_fn`: a function to transform the XOG response received from `src`.
-
+        - `transform_fn`: a function to transform the XOG response received from `src`.
+        - `buffer`: how many concurrent requests we're allowed to run.
         """
         # TODO: throw a useful exception instead
         assert self.src.auth is not None, "src is not logged in. call `self.src.login`"
+        assert self.dest.auth is not None, (
+            "dest is not logged in. call `self.dest.login`"
+        )
 
         match content:
             case xog.ContentPack():
                 databus = content.to_databus()
                 return await self.migrate(databus)
             case xog.DataBus():
-                # TODO: handle pagination:
-                # https://techdocs.broadcom.com/us/en/ca-enterprise-software/business-management/clarity-project-and-portfolio-management-ppm-on-premise/16-3-2/reference/xml-open-gateway-xog-development/xog-governor-node-limit.html#:~:text=Copy-,XOG%20Read,-For%20a%20XOG
-                content_pack = content.as_xml()
-                resp = await self.src.run_xog(content_pack)
+                snd, recv = aio.create_memory_object_stream[tuple[int, xml.Element]](
+                    buffer
+                )
+
+                responses: list[xml.Element] = []
+                async with aio.create_task_group() as tg:
+                    tg.start_soon(
+                        self._aiter_paginate_stream,
+                        content,
+                        snd,
+                        transform_fn,
+                    )
+
+                    # FIXME: this will probably hang
+                    async for page_num, resp in recv:
+                        tg.start_soon(
+                            self.dest.run_xog,
+                            resp,
+                            name=f"{content.header.object_type}-{page_num}",
+                        )
+                        responses.append(resp)
+
+                return responses
+            case _:
+                raise NotImplementedError(content)
+
+    async def _aiter_paginate_stream(
+        self,
+        databus: xog.DataBus,
+        snd: MemoryObjectSendStream[tuple[int, xml.Element]],
+        transform_fn: Callable[[xml.Element], xml.Element] | None = None,
+    ):
+        from itertools import count
+
+        async with snd:
+            for page_num in count(1):
+                # this will always runs once
+                content_pack = databus.as_xml()
+                resp, skip = await self.src.run_xog(content_pack)
                 if transform_fn is not None:
                     resp = transform_fn(resp)
 
-                assert self.dest.auth is not None, (
-                    "dest is not logged in. call `self.dest.login`"
-                )
-                return await self.dest.run_xog(resp)
-            case _:
-                raise NotImplementedError(content)
+                await snd.send((page_num, resp))
+                if skip is None:
+                    break
+                databus.header.args["skip"] = skip
 
 
 def get_databus(root: xml.Element) -> xml.Element:
@@ -211,24 +273,24 @@ def get_databus(root: xml.Element) -> xml.Element:
     return root
 
 
-def try_error(el: xml.Element) -> xml.Element:
+def try_error(el: xml.Element) -> tuple[xml.Element, int | None]:
     xog_output = el.find(".//XOGOutput", namespaces=xml.NS)
-    if xog_output is not None:
-        status = xog_output.find("Status")
-        if status is not None:
-            status_state = status.get("state", "OK")
+    if xog_output is not None and (status := xog_output.find("Status")) is not None:
+        status_state = status.get("state", "OK")
 
-            if status_state == "FAILURE":
-                error_info = xog_output.find("ErrorInformation")
-                if error_info is None:
-                    raise XogFailureException(el)
+        if status_state == "FAILURE":
+            error_info = xog_output.find("ErrorInformation")
+            if error_info is None:
+                raise XogFailureException(el)
 
-                raise XogException(
-                    severity=error_info.findtext("Severity", "FATAL"),
-                    description=error_info.findtext(
-                        "Description", "Failed running XOG"
-                    ),
-                    doc=el,
-                )
+            raise XogException(
+                severity=error_info.findtext("Severity", "FATAL"),
+                description=error_info.findtext("Description", "Failed running XOG"),
+                doc=el,
+            )
 
-    return get_databus(el)
+    # https://techdocs.broadcom.com/us/en/ca-enterprise-software/business-management/clarity-project-and-portfolio-management-ppm-on-premise/16-3-2/reference/xml-open-gateway-xog-development/xog-governor-node-limit.html#:~:text=Copy-,XOG%20Read,-For%20a%20XOG
+    skip_value = xog_output.xpath(".//Skip/@value") if xog_output is not None else []
+    skip_value = None if len(skip_value) == 0 else int(skip_value[0])
+
+    return get_databus(el), skip_value

@@ -152,7 +152,6 @@ class DataBus:
 
     def as_xml(self) -> xml.Element:
         databus = xml.create_element("NikuDataBus")
-        # databus.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
 
         header = xml.create_element(
             "Header",
